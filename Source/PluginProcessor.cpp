@@ -10,48 +10,80 @@
 #include "PluginEditor.h"
 #include <vector>
 
-struct SineWaveSound: public juce::SynthesiserSound {
-    SineWaveSound() {}
+class LowPass {
+    float previousSample = 0.0;
+public:
+    float getNextSample(float currentSample) {
+        float outputSample = 0.5 * (currentSample + previousSample);
+        previousSample = currentSample;
+        return outputSample;
+    }
     
-    bool appliesToNote(int) override {return true;}
-    bool appliesToChannel(int) override {return true;}
+    void clearState() {
+        previousSample = 0.0;
+    }
 };
 
-struct SineWaveVoice: public juce::SynthesiserVoice {
-    double currentAngle, angleDelta, level = 0.0;
-    SineWaveVoice(){}
-    
-    bool canPlaySound (juce::SynthesiserSound* sound) override {
-        return true;
+class AllPass {
+    float a = 0.5;
+    float previousInput = 0.0;
+    float previousOutput = 0.0;
+public:
+    float getNextOutput(float currentInput) {
+        float outputSample = a * (currentInput - previousOutput) + previousInput;
+        previousOutput = outputSample;
+        previousInput = currentInput;
+        return outputSample;
     }
     
-    void startNote(int midiNoteNumber, float velocity, juce::SynthesiserSound*, int) override {
-        currentAngle = 0.0;
-        level = velocity * 0.15;
-        auto cyclesPerSecond = juce::MidiMessage::getMidiNoteInHertz(midiNoteNumber);
-        auto cyclesPerSample = cyclesPerSecond / getSampleRate();
-        angleDelta = cyclesPerSample * 2.0 * juce::MathConstants<double>::pi;
+    void updateCoefficient(float phaseDelay, float fundamentalFreq, float sampleFreq) {
+        auto omega_0 = juce::MathConstants<float>::twoPi * fundamentalFreq / sampleFreq;
+        a = sin((1 - phaseDelay) * omega_0 / 2) / sin((1 + phaseDelay) * omega_0 / 2);
     }
     
-    void renderNextBlock(juce::AudioSampleBuffer& outputBuffer, int startSample, int numSamples) override {
-        if (angleDelta != 0.0) {
-            for (int channel = 0; channel < outputBuffer.getNumChannels(); channel++) {
-                for(int i = 0; i < numSamples; i++) {
-                    auto currentSample = (float) (std::sin(currentAngle) * level);
-                    outputBuffer.addSample(channel, startSample + i, currentSample);
-                    currentAngle += angleDelta;
-                }
-            }
+    void clearState() {
+        previousInput = 0.0;
+        previousOutput = 0.0;
+    }
+};
+
+class RingBuffer {
+    // will fail in the niche use case of 96kHz and notes below midi G-1 (24.5Hz)
+    float buffer[4096];
+    juce::AbstractFifo abstractFifo { 4096 };
+    juce::Random random;
+public:
+    void reset() {
+        abstractFifo.reset();
+    }
+    void setSize(int newSize) {
+        abstractFifo.setTotalSize(newSize);
+    }
+    float nextSample() {
+        auto readHandle = abstractFifo.read(1);
+        if (readHandle.blockSize1 == 1) {
+            return buffer[readHandle.startIndex1];
+        } else {
+            return buffer[readHandle.startIndex2];
         }
     }
     
-    void stopNote(float, bool) override {
-        clearCurrentNote();
-        angleDelta = 0.0;
+    void writeSample(float sample) {
+        auto writeHandle = abstractFifo.write(1);
+        if (writeHandle.blockSize1 == 1) {
+            buffer[writeHandle.startIndex1] = sample;
+        } else {
+            buffer[writeHandle.startIndex2] = sample;
+        }
     }
     
-    virtual void controllerMoved(int,int) override {}
-    virtual void pitchWheelMoved(int) override {}
+    void setImpulse(int loopSize) {
+        setSize(loopSize);
+        auto remaining_space = abstractFifo.getFreeSpace();
+        while(remaining_space--) {
+            writeSample(random.nextFloat() - 0.5);
+        }
+    }
 };
 
 struct KsSound: public juce::SynthesiserSound {
@@ -64,10 +96,12 @@ struct KsSound: public juce::SynthesiserSound {
 struct KsVoice: public juce::SynthesiserVoice {
     double level = 0.0;
     // TODO: change to use a proper circular buffer
-    std::queue<float> previous_samples;
+//    std::queue<float> previousSamples;
+    RingBuffer previousSamples;
     juce::Random random;
     bool isPlaying;
-    float prev_for_lowpass = 0.0;
+    LowPass lp;
+    AllPass ap;
     
     KsVoice(){}
     
@@ -76,29 +110,32 @@ struct KsVoice: public juce::SynthesiserVoice {
     }
     
     void startNote(int midiNoteNumber, float velocity, juce::SynthesiserSound*, int) override {
-        for(int i = 0; i < 50; i++) {
-            previous_samples.push(random.nextFloat() - 0.5);
-        }
+        float fundamentalFreq = juce::MidiMessage::getMidiNoteInHertz(midiNoteNumber);
+        float requiredLoopDelay = getSampleRate() / fundamentalFreq;
+        float requiredPreviousSamples = floor(requiredLoopDelay - 0.5);
+        auto requiredPhaseDelay = requiredLoopDelay - 0.5 - requiredPreviousSamples;
+        ap.updateCoefficient(requiredPhaseDelay, fundamentalFreq, getSampleRate());
+        previousSamples.setSize(requiredLoopDelay);
+        previousSamples.setImpulse(requiredLoopDelay);
         
-        level = velocity * 0.15;
+        level = velocity * 0.5;
         isPlaying = true;
     }
     
     void renderNextBlock(juce::AudioSampleBuffer& outputBuffer, int startSample, int numSamples) override {
         if (isPlaying) {
-
-
             for (int channel = 0; channel < outputBuffer.getNumChannels(); channel++) {
                 for(int i = 0; i < numSamples; i++) {
-
                     // Get previous sample
-                    auto input_sample = previous_samples.front();
-                    previous_samples.pop();
+//                    float inputSample = previousSamples.front();
+//                    previousSamples.pop();
+                    float inputSample = previousSamples.nextSample();
                     // Lowpass it
-                    float output_sample = 0.5 * (prev_for_lowpass + input_sample);
-                    prev_for_lowpass = input_sample;
-                    outputBuffer.addSample(channel, startSample + i, output_sample);
-                    previous_samples.push(output_sample);
+                    float intermediateSample = lp.getNextSample(inputSample);
+                    // Allpass it
+                    float outputSample = ap.getNextOutput(intermediateSample);
+                    previousSamples.writeSample(outputSample);
+                    outputBuffer.addSample(channel, startSample + i, outputSample);
                 }
             }
         }
@@ -107,10 +144,9 @@ struct KsVoice: public juce::SynthesiserVoice {
     void stopNote(float, bool) override {
         clearCurrentNote();
         isPlaying = false;
-        prev_for_lowpass = 0.0;
-        while(!previous_samples.empty()) {
-            previous_samples.pop();
-        }
+        lp.clearState();
+        ap.clearState();
+        previousSamples.reset();
     }
     
     virtual void controllerMoved(int,int) override {}
@@ -124,15 +160,12 @@ KarplusStrongAudioProcessor::KarplusStrongAudioProcessor()
 #ifndef JucePlugin_PreferredChannelConfigurations
      : AudioProcessor (BusesProperties()
                      #if ! JucePlugin_IsMidiEffect
-                      #if ! JucePlugin_IsSynth
-//                       .withInput  ("Input",  juce::AudioChannelSet::mono(), true)
-                      #endif
                        .withOutput ("Output", juce::AudioChannelSet::mono(), true)
                      #endif
                        )
 #endif
 {
-    for (auto i = 0; i < 1; i++) {
+    for (auto i = 0; i < 6; i++) {
         synth.addVoice(new KsVoice());
     };
     synth.addSound(new KsSound());
