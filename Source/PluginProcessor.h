@@ -19,6 +19,7 @@ class KarplusStrongAudioProcessor  : public juce::AudioProcessor
                             #endif
 {
 public:
+    juce::AudioParameterFloat* pickPosition;
     //==============================================================================
     KarplusStrongAudioProcessor();
     ~KarplusStrongAudioProcessor() override;
@@ -60,6 +61,7 @@ private:
     //==============================================================================
     void updateAngleDelta();
     juce::Synthesiser synth;
+    
     
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (KarplusStrongAudioProcessor)
 };

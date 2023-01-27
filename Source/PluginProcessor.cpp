@@ -8,117 +8,57 @@
 
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "Filters.h"
+#include "Utils.h"
+#include "Exciter.h"
 #include <vector>
 
-class LowPass {
-    float previousSample = 0.0;
-public:
-    float getNextSample(float currentSample) {
-        float outputSample = 0.5 * (currentSample + previousSample);
-        previousSample = currentSample;
-        return outputSample;
-    }
-    
-    void clearState() {
-        previousSample = 0.0;
-    }
-};
+using juce::dsp::DelayLine;
+using juce::MidiMessage;
 
-class AllPass {
-    float a = 0.5;
-    float previousInput = 0.0;
-    float previousOutput = 0.0;
-public:
-    float getNextOutput(float currentInput) {
-        float outputSample = a * (currentInput - previousOutput) + previousInput;
-        previousOutput = outputSample;
-        previousInput = currentInput;
-        return outputSample;
-    }
-    
-    void updateCoefficient(float phaseDelay, float fundamentalFreq, float sampleFreq) {
-        auto omega_0 = juce::MathConstants<float>::twoPi * fundamentalFreq / sampleFreq;
-        a = sin((1 - phaseDelay) * omega_0 / 2) / sin((1 + phaseDelay) * omega_0 / 2);
-    }
-    
-    void clearState() {
-        previousInput = 0.0;
-        previousOutput = 0.0;
-    }
-};
-
-class RingBuffer {
-    // will fail in the niche use case of 96kHz and notes below midi G-1 (24.5Hz)
-    float buffer[4096];
-    juce::AbstractFifo abstractFifo { 4096 };
-    juce::Random random;
-public:
-    void reset() {
-        abstractFifo.reset();
-    }
-    void setSize(int newSize) {
-        abstractFifo.setTotalSize(newSize);
-    }
-    float nextSample() {
-        auto readHandle = abstractFifo.read(1);
-        if (readHandle.blockSize1 == 1) {
-            return buffer[readHandle.startIndex1];
-        } else {
-            return buffer[readHandle.startIndex2];
-        }
-    }
-    
-    void writeSample(float sample) {
-        auto writeHandle = abstractFifo.write(1);
-        if (writeHandle.blockSize1 == 1) {
-            buffer[writeHandle.startIndex1] = sample;
-        } else {
-            buffer[writeHandle.startIndex2] = sample;
-        }
-    }
-    
-    void setImpulse(int loopSize) {
-        setSize(loopSize);
-        auto remaining_space = abstractFifo.getFreeSpace();
-        while(remaining_space--) {
-            writeSample(random.nextFloat() - 0.5);
-        }
-    }
-};
 
 struct KsSound: public juce::SynthesiserSound {
     KsSound() {}
-    
     bool appliesToNote(int) override {return true;}
     bool appliesToChannel(int) override {return true;}
 };
 
-struct KsVoice: public juce::SynthesiserVoice {
-    double level = 0.0;
-    // TODO: change to use a proper circular buffer
-//    std::queue<float> previousSamples;
-    RingBuffer previousSamples;
-    juce::Random random;
-    bool isPlaying;
+class KsVoice: public juce::SynthesiserVoice {
+    // Parameters that should be user adjustable
+public:
+    float pickPosition = 0.5;
+    
+    // Not parameters
+private:
+    DelayLine<float> previousSamples;
+    Exciter exciter;
     LowPass lp;
     AllPass ap;
+    bool isPlaying = false;
+    float level = 0.0;
     
-    KsVoice(){}
-    
+public:
+    KsVoice(){
+        // Set up the delay line
+        juce::dsp::ProcessSpec spec { getSampleRate(), 1024, 1 };
+        previousSamples.prepare(spec);
+        int maxLoopLen = getSampleRate() / MidiMessage::getMidiNoteInHertz(0);
+        previousSamples.setMaximumDelayInSamples(maxLoopLen);
+        exciter.prepare(maxLoopLen, spec);
+    }
+
     bool canPlaySound (juce::SynthesiserSound* sound) override {
         return true;
     }
     
     void startNote(int midiNoteNumber, float velocity, juce::SynthesiserSound*, int) override {
         float fundamentalFreq = juce::MidiMessage::getMidiNoteInHertz(midiNoteNumber);
-        float requiredLoopDelay = getSampleRate() / fundamentalFreq;
-        float requiredPreviousSamples = floor(requiredLoopDelay - 0.5);
-        auto requiredPhaseDelay = requiredLoopDelay - 0.5 - requiredPreviousSamples;
+        auto [requiredPreviousSamples, requiredPhaseDelay] = calculateRequiredDelays(fundamentalFreq);
         ap.updateCoefficient(requiredPhaseDelay, fundamentalFreq, getSampleRate());
-        previousSamples.setSize(requiredLoopDelay);
-        previousSamples.setImpulse(requiredLoopDelay);
-        
-        level = velocity * 0.5;
+        previousSamples.setDelay(requiredPreviousSamples);
+//        exciter.populateImpulse(previousSamples);
+        exciter.impulsePicked(previousSamples, pickPosition);
+        level = velocity;
         isPlaying = true;
     }
     
@@ -127,15 +67,14 @@ struct KsVoice: public juce::SynthesiserVoice {
             for (int channel = 0; channel < outputBuffer.getNumChannels(); channel++) {
                 for(int i = 0; i < numSamples; i++) {
                     // Get previous sample
-//                    float inputSample = previousSamples.front();
-//                    previousSamples.pop();
-                    float inputSample = previousSamples.nextSample();
+                    float inputSample = previousSamples.popSample(0);
                     // Lowpass it
                     float intermediateSample = lp.getNextSample(inputSample);
                     // Allpass it
                     float outputSample = ap.getNextOutput(intermediateSample);
-                    previousSamples.writeSample(outputSample);
-                    outputBuffer.addSample(channel, startSample + i, outputSample);
+                    // Push it to delay line
+                    previousSamples.pushSample(0, outputSample);
+                    outputBuffer.addSample(channel, startSample + i, outputSample * level);
                 }
             }
         }
@@ -151,30 +90,63 @@ struct KsVoice: public juce::SynthesiserVoice {
     
     virtual void controllerMoved(int,int) override {}
     virtual void pitchWheelMoved(int) override {}
+    
+private:
+    std::tuple<float, float> calculateRequiredDelays(float fundamentalFreq) {
+        float requiredLoopDelay = getSampleRate() / fundamentalFreq;
+        float requiredPreviousSamples = floor(requiredLoopDelay - 0.5);
+        auto requiredPhaseDelay = requiredLoopDelay - 0.5 - requiredPreviousSamples;
+        return {requiredPreviousSamples, requiredPhaseDelay};
+    }
 };
 
 
 
 //==============================================================================
 KarplusStrongAudioProcessor::KarplusStrongAudioProcessor()
-#ifndef JucePlugin_PreferredChannelConfigurations
      : AudioProcessor (BusesProperties()
-                     #if ! JucePlugin_IsMidiEffect
                        .withOutput ("Output", juce::AudioChannelSet::mono(), true)
-                     #endif
-                       )
-#endif
-{
+                       ){
     for (auto i = 0; i < 6; i++) {
         synth.addVoice(new KsVoice());
     };
     synth.addSound(new KsSound());
+         addParameter(pickPosition = new juce::AudioParameterFloat(juce::ParameterID { "pickPosition",  1 }, "Pick Position", 0.0f, 1.0f, 0.5f));
+
 }
 
 KarplusStrongAudioProcessor::~KarplusStrongAudioProcessor()
 {
 }
 
+//==============================================================================
+
+void KarplusStrongAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
+{
+    // Use this method as the place to do any pre-playback
+    // initialisation that you need..
+    synth.setCurrentPlaybackSampleRate(sampleRate);
+}
+
+void KarplusStrongAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages)
+{
+    juce::ScopedNoDenormals noDenormals;
+    auto totalNumInputChannels  = getTotalNumInputChannels();
+    auto totalNumOutputChannels = getTotalNumOutputChannels();
+
+    // In case we have more outputs than inputs, this code clears any output
+    // channels that didn't contain input data in case they contain nonzero data
+    for (auto i = totalNumInputChannels; i < totalNumOutputChannels; ++i)
+        buffer.clear (i, 0, buffer.getNumSamples());
+    for (int i = 0; i < synth.getNumVoices(); i++) {
+        auto voice = dynamic_cast<KsVoice*>(synth.getVoice(i));
+        voice->pickPosition = pickPosition->get();
+    }
+    synth.renderNextBlock(buffer, midiMessages, 0, buffer.getNumSamples());
+}
+
+//==============================================================================
+//=======================HERE BE BOILERPLATE====================================
 //==============================================================================
 
 const juce::String KarplusStrongAudioProcessor::getName() const
@@ -239,12 +211,7 @@ void KarplusStrongAudioProcessor::changeProgramName (int index, const juce::Stri
 }
 
 //==============================================================================
-void KarplusStrongAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
-{
-    // Use this method as the place to do any pre-playback
-    // initialisation that you need..
-    synth.setCurrentPlaybackSampleRate(sampleRate);
-}
+
 
 void KarplusStrongAudioProcessor::releaseResources()
 {
@@ -277,31 +244,6 @@ bool KarplusStrongAudioProcessor::isBusesLayoutSupported (const BusesLayout& lay
   #endif
 }
 #endif
-
-void KarplusStrongAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages)
-{
-    juce::ScopedNoDenormals noDenormals;
-    auto totalNumInputChannels  = getTotalNumInputChannels();
-    auto totalNumOutputChannels = getTotalNumOutputChannels();
-
-    // In case we have more outputs than inputs, this code clears any output
-    // channels that didn't contain input data, (because these aren't
-    // guaranteed to be empty - they may contain garbage).
-    // This is here to avoid people getting screaming feedback
-    // when they first compile a plugin, but obviously you don't need to keep
-    // this code if your algorithm always overwrites all the output channels.
-    for (auto i = totalNumInputChannels; i < totalNumOutputChannels; ++i)
-        buffer.clear (i, 0, buffer.getNumSamples());
-
-    // This is the place where you'd normally do the guts of your plugin's
-    // audio processing...
-    // Make sure to reset the state if your inner loop is processing
-    // the samples and the outer loop is handling the channels.
-    // Alternatively, you can process the samples with the channels
-    // interleaved by keeping the same state.
-
-    synth.renderNextBlock(buffer, midiMessages, 0, buffer.getNumSamples());
-}
 
 //==============================================================================
 bool KarplusStrongAudioProcessor::hasEditor() const
